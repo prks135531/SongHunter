@@ -265,34 +265,69 @@ fun encodePathPart(value: String): String =
     URLEncoder.encode(value, "UTF-8").replace("+", "%20")
 
 suspend fun searchAll(term: String): List<Track> = withContext(Dispatchers.IO) {
-    val ia = searchInternetArchive(term)
-    val commons = searchCommons(term)
-    (ia + commons)
-        .filter { relevanceScore(term, it.title, it.creator) > 0 }
-        .distinctBy { it.detailUrl + it.fileName }
-        .sortedByDescending { relevanceScore(term, it.title, it.creator) }
+    val queries = buildSearchQueries(term)
+    val iaResults = mutableListOf<Track>()
+    val commonsResults = mutableListOf<Track>()
+    for (q in queries) {
+        try { iaResults.addAll(searchInternetArchive(q)) } catch (_: Exception) { }
+        try { commonsResults.addAll(searchCommons(q)) } catch (_: Exception) { }
+    }
+    (iaResults + commonsResults)
+        .distinctBy { it.detailUrl + "|" + (it.fileName ?: "") }
+        .map { it to relevanceScore(term, it.title, it.creator, it.fileName.orEmpty()) }
+        .filter { it.second >= 25 }
+        .sortedWith(compareByDescending<Pair<Track, Int>> { it.second }
+            .thenByDescending { if (it.first.canDownload) 1 else 0 }
+            .thenBy { it.first.title.length })
+        .map { it.first }
         .take(60)
 }
 
-fun normalizeSearchText(value: String): String =
-    value.lowercase(Locale.ROOT).replace(Regex("[^\\p{L}\\p{N}]+"), " ").trim()
+fun buildSearchQueries(input: String): List<String> {
+    val cleaned = input.trim().replace(Regex("\\s+"), " ")
+    val noPunctuation = cleaned.replace(Regex("[\\p{Punct}]+"), " ").replace(Regex("\\s+"), " ").trim()
+    val variants = linkedSetOf<String>()
+    if (cleaned.isNotBlank()) variants.add(cleaned)
+    if (noPunctuation.isNotBlank() && !noPunctuation.equals(cleaned, true)) variants.add(noPunctuation)
+    return variants.take(2)
+}
 
-fun relevanceScore(query: String, title: String, creator: String): Int {
+fun normalizeSearchText(value: String): String =
+    value.lowercase(Locale.ROOT)
+        .replace("ё", "е")
+        .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+
+fun relevanceScore(query: String, title: String, creator: String, fileName: String = ""): Int {
     val q = normalizeSearchText(query)
     val t = normalizeSearchText(title)
     val a = normalizeSearchText(creator)
-    if (q.isBlank() || t.isBlank()) return 0
-    if (t == q) return 100
-    if (t.contains(q)) return 90
+    val f = normalizeSearchText(fileName.substringBeforeLast('.', fileName))
+    if (q.isBlank() || (t.isBlank() && f.isBlank())) return 0
+    if (t == q) return 120
+    if (t.startsWith("$q ")) return 110
+    if (t.contains(q)) return 100
+    if (f == q || f.contains(q)) return 95
+
     val words = q.split(" ").filter { it.length > 1 }.distinct()
-    if (words.isEmpty()) return if (t.contains(q)) 80 else 0
-    val titleHits = words.count { word -> t.split(" ").any { it == word || it.startsWith(word) } }
-    val creatorHits = words.count { word -> a.split(" ").any { it == word || it.startsWith(word) } }
-    val ratio = titleHits.toDouble() / words.size
+    if (words.isEmpty()) return 0
+    val titleWords = t.split(" ").toSet()
+    val fileWords = f.split(" ").toSet()
+    val artistWords = a.split(" ").toSet()
+    val titleHits = words.count { word -> titleWords.any { it == word || (word.length >= 4 && it.startsWith(word)) } }
+    val fileHits = words.count { word -> fileWords.any { it == word || (word.length >= 4 && it.startsWith(word)) } }
+    val artistHits = words.count { word -> artistWords.any { it == word || (word.length >= 4 && it.startsWith(word)) } }
+    val titleRatio = titleHits.toDouble() / words.size
+    val fileRatio = fileHits.toDouble() / words.size
+
     return when {
-        ratio >= 0.75 -> 60 + titleHits
-        ratio >= 0.5 -> 35 + titleHits
-        creatorHits == words.size -> 20 + creatorHits
+        titleHits == words.size -> 85 + titleHits
+        titleRatio >= 0.75 -> 65 + titleHits
+        fileHits == words.size -> 80 + fileHits
+        fileRatio >= 0.75 -> 55 + fileHits
+        artistHits == words.size && titleHits > 0 -> 45 + artistHits + titleHits
+        titleRatio >= 0.5 -> 30 + titleHits
         else -> 0
     }
 }
@@ -310,15 +345,17 @@ fun getJson(url: String): JSONObject {
 }
 
 fun searchInternetArchive(term: String): List<Track> {
-    val q = "\"$term\" AND mediatype:audio"
+    val escaped = term.replace("\\", " ").replace("\"", " ").trim()
+    val q = "\"$escaped\" AND mediatype:audio"
     val url = "https://archive.org/advancedsearch.php?q=${URLEncoder.encode(q, "UTF-8")}" +
-        "&fl[]=identifier&fl[]=title&fl[]=creator&fl[]=year&rows=18&page=1&output=json"
+        "&fl[]=identifier&fl[]=title&fl[]=creator&fl[]=year&rows=30&page=1&output=json"
     val docs = getJson(url).optJSONObject("response")?.optJSONArray("docs") ?: return emptyList()
     val out = mutableListOf<Track>()
+    val seenIds = mutableSetOf<String>()
     for (i in 0 until docs.length()) {
         val doc = docs.optJSONObject(i) ?: continue
         val id = doc.optString("identifier")
-        if (id.isBlank()) continue
+        if (id.isBlank() || !seenIds.add(id)) continue
         try {
             val meta = getJson("https://archive.org/metadata/${URLEncoder.encode(id, "UTF-8")}")
             val metadata = meta.optJSONObject("metadata") ?: JSONObject()
@@ -349,7 +386,7 @@ fun searchInternetArchive(term: String): List<Track> {
                         canDownload = permitted
                     )
                 )
-                if (out.size >= 30) break
+                if (out.size >= 12) break
             }
         } catch (_: Exception) {
             // Ignore an unavailable archive item and continue with other results.
@@ -359,7 +396,8 @@ fun searchInternetArchive(term: String): List<Track> {
 }
 
 fun searchCommons(term: String): List<Track> {
-    val search = URLEncoder.encode("filetype:audio $term", "UTF-8")
+    val safeTerm = term.replace("\"", " ").trim()
+    val search = URLEncoder.encode("filetype:audio $safeTerm", "UTF-8")
     val url = "https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=$search" +
         "&gsrnamespace=6&gsrlimit=20&prop=imageinfo&iiprop=url%7Csize%7Cextmetadata&format=json"
     val pages = getJson(url).optJSONObject("query")?.optJSONObject("pages") ?: return emptyList()
