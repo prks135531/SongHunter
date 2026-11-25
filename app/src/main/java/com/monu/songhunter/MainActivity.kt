@@ -241,24 +241,60 @@ fun TrackCard(track: Track, context: Context, onDownload: () -> Unit) {
 
 fun startDownload(context: Context, track: Track) {
     val url = track.downloadUrl ?: return
-    val request = DownloadManager.Request(Uri.parse(url))
-        .setTitle(track.title)
-        .setDescription("Downloading from ${track.source}")
-        .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-        .setDestinationInExternalPublicDir(Environment.DIRECTORY_MUSIC, "SongHunter/${safeName(track.fileName ?: track.title)}")
-        .setAllowedOverMetered(true)
-        .setAllowedOverRoaming(false)
-    val manager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-    manager.enqueue(request)
-    Toast.makeText(context, "Download started. Check notifications.", Toast.LENGTH_LONG).show()
+    try {
+        val request = DownloadManager.Request(Uri.parse(url))
+            .setTitle(track.title)
+            .setDescription("Downloading from ${track.source}")
+            .setMimeType("audio/*")
+            .addRequestHeader("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36")
+            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            .setDestinationInExternalPublicDir(Environment.DIRECTORY_MUSIC, "SongHunter/${safeName(track.fileName ?: track.title)}")
+            .setAllowedOverMetered(true)
+            .setAllowedOverRoaming(false)
+        val manager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        manager.enqueue(request)
+        Toast.makeText(context, "Download queued. Check the notification shade.", Toast.LENGTH_LONG).show()
+    } catch (e: Exception) {
+        Toast.makeText(context, "Could not start download: ${e.message ?: "check connection"}", Toast.LENGTH_LONG).show()
+    }
 }
 
 fun safeName(value: String): String = value.replace(Regex("[^a-zA-Z0-9._-]"), "_")
 
+fun encodePathPart(value: String): String =
+    URLEncoder.encode(value, "UTF-8").replace("+", "%20")
+
 suspend fun searchAll(term: String): List<Track> = withContext(Dispatchers.IO) {
     val ia = searchInternetArchive(term)
     val commons = searchCommons(term)
-    (ia + commons).distinctBy { it.detailUrl + it.fileName }.take(60)
+    (ia + commons)
+        .filter { relevanceScore(term, it.title, it.creator) > 0 }
+        .distinctBy { it.detailUrl + it.fileName }
+        .sortedByDescending { relevanceScore(term, it.title, it.creator) }
+        .take(60)
+}
+
+fun normalizeSearchText(value: String): String =
+    value.lowercase(Locale.ROOT).replace(Regex("[^\\p{L}\\p{N}]+"), " ").trim()
+
+fun relevanceScore(query: String, title: String, creator: String): Int {
+    val q = normalizeSearchText(query)
+    val t = normalizeSearchText(title)
+    val a = normalizeSearchText(creator)
+    if (q.isBlank() || t.isBlank()) return 0
+    if (t == q) return 100
+    if (t.contains(q)) return 90
+    val words = q.split(" ").filter { it.length > 1 }.distinct()
+    if (words.isEmpty()) return if (t.contains(q)) 80 else 0
+    val titleHits = words.count { word -> t.split(" ").any { it == word || it.startsWith(word) } }
+    val creatorHits = words.count { word -> a.split(" ").any { it == word || it.startsWith(word) } }
+    val ratio = titleHits.toDouble() / words.size
+    return when {
+        ratio >= 0.75 -> 60 + titleHits
+        ratio >= 0.5 -> 35 + titleHits
+        creatorHits == words.size -> 20 + creatorHits
+        else -> 0
+    }
 }
 
 fun getJson(url: String): JSONObject {
@@ -274,7 +310,7 @@ fun getJson(url: String): JSONObject {
 }
 
 fun searchInternetArchive(term: String): List<Track> {
-    val q = "($term) AND mediatype:audio"
+    val q = "\"$term\" AND mediatype:audio"
     val url = "https://archive.org/advancedsearch.php?q=${URLEncoder.encode(q, "UTF-8")}" +
         "&fl[]=identifier&fl[]=title&fl[]=creator&fl[]=year&rows=18&page=1&output=json"
     val docs = getJson(url).optJSONObject("response")?.optJSONArray("docs") ?: return emptyList()
@@ -298,7 +334,7 @@ fun searchInternetArchive(term: String): List<Track> {
                     lower.endsWith(".ogg") || lower.endsWith(".m4a") || lower.endsWith(".wav")
                 if (!audio || file.optString("source") == "metadata") continue
                 val permitted = isRecognizedOpenLicense(licenseUrl, license)
-                val download = "https://archive.org/download/${id}/${name.split("/").joinToString("/") { URLEncoder.encode(it, "UTF-8") }}"
+                val download = "https://archive.org/download/${id}/${name.split("/").joinToString("/") { encodePathPart(it) }}"
                 out.add(
                     Track(
                         title = doc.optString("title", id),
