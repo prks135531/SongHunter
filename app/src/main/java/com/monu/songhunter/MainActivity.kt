@@ -319,7 +319,7 @@ fun searchInternetArchive(term: String): List<Track> {
             // Ignore an unavailable archive item and continue with other results.
         }
     }
-    out
+    return out
 }
 
 fun searchCommons(term: String): List<Track> {
